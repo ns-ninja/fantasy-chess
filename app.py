@@ -130,7 +130,7 @@ def simulate_result(ra, rb):
 
     # Decisive game: win probability with a slight upset factor
     raw_win = expected_score(ra, rb)
-    upset  = 0.06
+    upset = st.session_state.get("upset", 0.06)
     win_prob = raw_win * (1.0 - upset) + 0.5 * upset
     win_prob = max(0.05, min(0.95, win_prob))
 
@@ -198,6 +198,33 @@ def make_pairings(players):
     pairings = []
     leftover = []
 
+    def _pair_list_no_rematch(lst):
+        # Return list of (name1, name2) pairs or None if impossible
+        if len(lst) % 2 == 1:
+            return None
+
+        # Work with player dicts
+        names = [p["name"] for p in lst]
+        name_to_p = {p["name"]: p for p in lst}
+
+        # Recursive backtracking
+        def helper(remaining):
+            if not remaining:
+                return []
+            a = remaining[0]
+            for i in range(1, len(remaining)):
+                b = remaining[i]
+                # skip if they already played
+                if b in name_to_p[a]["opponents"]:
+                    continue
+                rest = remaining[1:i] + remaining[i+1:]
+                sub = helper(rest)
+                if sub is not None:
+                    return [(a, b)] + sub
+            return None
+
+        return helper(names)
+
     for score in scores_desc:
         group = leftover + score_groups[score]
         group.sort(key=lambda p: -p["rating"])
@@ -229,21 +256,40 @@ def make_pairings(players):
             if b["name"] not in used_bot:
                 leftover.append(b)
 
-    # Pair remaining leftovers (force rematch if needed)
+    # Pair remaining leftovers — attempt to avoid rematches via backtracking
     leftover.sort(key=lambda p: (-p["score"], -p["rating"]))
-    while len(leftover) >= 2:
-        p1 = leftover.pop(0)
-        match_idx = None
-        # Prefer no rematch
-        for i, p2 in enumerate(leftover):
-            if p2["name"] not in p1["opponents"]:
-                match_idx = i
-                break
-        if match_idx is None:
-            match_idx = 0   # forced rematch
-        p2 = leftover.pop(match_idx)
-        w, bl = assign_colors(p1, p2)
-        pairings.append({"white": w["name"], "black": bl["name"], "result": None})
+    if len(leftover) >= 2:
+        matching = _pair_list_no_rematch(leftover)
+        if matching is None:
+            # Try matching across the entire pool (excluding bye) as a fallback
+            try_pool = [p for p in sorted_players if p not in ( [bye_player] if bye_player else [] )]
+            if len(try_pool) % 2 == 0:
+                matching = _pair_list_no_rematch(try_pool)
+
+        if matching is not None:
+            # consume matched pairs from leftover where possible, otherwise from pool
+            used = set()
+            for a_name, b_name in matching:
+                a = get_player(a_name)
+                b = get_player(b_name)
+                if a is None or b is None:
+                    continue
+                pairings.append({"white": assign_colors(a, b)[0]["name"], "black": assign_colors(a, b)[1]["name"], "result": None})
+            leftover = []
+        else:
+            # As last resort (should be rare), fall back to greedy pairing allowing rematches
+            while len(leftover) >= 2:
+                p1 = leftover.pop(0)
+                match_idx = None
+                for i, p2 in enumerate(leftover):
+                    if p2["name"] not in p1["opponents"]:
+                        match_idx = i
+                        break
+                if match_idx is None:
+                    match_idx = 0
+                p2 = leftover.pop(match_idx)
+                w, bl = assign_colors(p1, p2)
+                pairings.append({"white": w["name"], "black": bl["name"], "result": None})
 
     if leftover:
         if bye_player is None:
@@ -251,6 +297,19 @@ def make_pairings(players):
 
     if bye_player:
         pairings.append({"white": bye_player["name"], "black": "BYE", "result": None})
+
+    # Order pairings so players with higher standings appear on higher boards
+    name_to_index = {p["name"]: idx for idx, p in enumerate(sorted_players)}
+
+    def _pair_key(pair):
+        w, b = pair["white"], pair["black"]
+        if b == "BYE":
+            return 9999  # send BYE to bottom
+        wi = name_to_index.get(w, 9999)
+        bi = name_to_index.get(b, 9999)
+        return min(wi, bi)
+
+    pairings.sort(key=_pair_key)
 
     return pairings
 
@@ -311,6 +370,55 @@ def compute_buchholz():
                 if opp:
                     total += opp["score"]
         p["buchholz"] = total
+
+
+def _k_factor(rating):
+    # Simple USCF-like tiers: <2100 => 40, 2100-2399 => 20, >=2400 => 10
+    try:
+        r = int(rating)
+    except Exception:
+        r = 1500
+    if r < 2100:
+        return 40
+    if r < 2400:
+        return 20
+    return 10
+
+
+def compute_and_apply_rating_changes():
+    # Requires st.session_state.original_ratings snapshot
+    orig = st.session_state.get("original_ratings", {})
+    if not orig:
+        return {}
+
+    changes = {}
+    # Build name->player mapping for lookups
+    name_map = {p["name"]: p for p in st.session_state.players}
+
+    for p in st.session_state.players:
+        name = p["name"]
+        orig_r = orig.get(name, p.get("rating", 1500))
+        actual = 0.0
+        expected = 0.0
+        for opp_name, score in p["results"]:
+            if opp_name == "BYE":
+                actual += 1.0
+                expected += 1.0
+                continue
+            opp_orig_r = orig.get(opp_name, name_map.get(opp_name, {}).get("rating", 1500))
+            actual += float(score)
+            expected += expected_score(orig_r, opp_orig_r)
+
+        k = _k_factor(orig_r)
+        delta = k * (actual - expected)
+        delta_rounded = int(round(delta))
+        # Apply change to player rating
+        p["rating"] = int(round(orig_r + delta_rounded))
+        p["rating_change"] = delta_rounded
+        changes[name] = {"old": orig_r, "delta": delta_rounded, "new": p["rating"]}
+
+    st.session_state.ratings_applied = True
+    return changes
 
 
 def get_standings():
@@ -520,6 +628,12 @@ Paste one player per line. Supports common tournament export formats:<br>
             nr = st.number_input("Number of rounds", min_value=1, max_value=15,
                                   value=st.session_state.num_rounds, step=1)
             st.session_state.num_rounds = nr
+        with sc3:
+            # Upset factor control: influences randomness in simulate_result
+            upset_val = st.slider("Upset factor", min_value=0.00, max_value=0.30,
+                                  value=st.session_state.get("upset", 0.06), step=0.01,
+                                  help="Higher upset → more chances of lower-rated players winning")
+            st.session_state.upset = float(upset_val)
         with sc2:
             st.markdown("<br>", unsafe_allow_html=True)
             players_ok = len(st.session_state.players) >= 2
@@ -530,6 +644,9 @@ Paste one player per line. Supports common tournament export formats:<br>
                 st.session_state.tournament_done    = False
                 st.session_state.rounds             = []
                 st.session_state.current_round      = 0
+                # Snapshot original ratings for post-tournament rating calculations
+                st.session_state.original_ratings = {p["name"]: p["rating"] for p in st.session_state.players}
+                st.session_state.ratings_applied = False
                 st.session_state.pending_pairings   = make_pairings(st.session_state.players)
                 st.rerun()
         with sc3:
@@ -615,10 +732,23 @@ with tab2:
 
         else:
             st.success("## 🏆 Tournament Complete!")
+            # Apply rating changes once when tournament completes
+            if not st.session_state.get("ratings_applied", False):
+                rating_changes = compute_and_apply_rating_changes()
+            else:
+                rating_changes = {}
+
             standings = get_standings()
             if standings:
                 winner = standings[0]
                 st.markdown(f"### 🥇 Winner: **{winner['Name']}** — {winner['Score']} pts")
+            if rating_changes:
+                st.markdown("**Rating changes**")
+                rc_rows = []
+                for n, info in rating_changes.items():
+                    sign = "+" if info["delta"] >= 0 else ""
+                    rc_rows.append({"Name": n, "Old": info["old"], "Change": f"{sign}{info['delta']}", "New": info["new"]})
+                st.dataframe(pd.DataFrame(rc_rows), hide_index=True, use_container_width=True)
 
         # ── Completed rounds ──────────────────────────────────────────────────
         if st.session_state.rounds:
@@ -670,12 +800,26 @@ with tab3:
                     unsafe_allow_html=True)
 
         s_rows = []
+        # Build name->rank map from final standings
+        name_to_rank = {s["Name"]: idx + 1 for idx, s in enumerate(standings)}
         for i, s in enumerate(standings):
             p = s["_player"]
-            # Build result history string
-            hist = ""
+            # Build result history string using W/L/D + opponent final standing number
+            hist = []
             for opp, sc in p["results"]:
-                hist += result_icon(sc) + " "
+                if opp == "BYE":
+                    hist.append("BYE")
+                    continue
+                opp_rank = name_to_rank.get(opp)
+                rank_str = str(opp_rank) if opp_rank is not None else "?"
+                if sc == 1.0:
+                    hist.append(f"W{rank_str}")
+                elif sc == 0.5:
+                    hist.append(f"D{rank_str}")
+                elif sc == 0.0:
+                    hist.append(f"L{rank_str}")
+                else:
+                    hist.append(f"?{rank_str}")
 
             s_rows.append({
                 "Rank": rank_medal(i),
@@ -683,7 +827,7 @@ with tab3:
                 "Rating": s["Rating"],
                 "Score": s["Score"],
                 "Buchholz": s["Buchholz"],
-                "Results": hist.strip(),
+                "Results": " ".join(hist),
             })
 
         stand_df = pd.DataFrame(s_rows)
@@ -714,12 +858,27 @@ with tab3:
                     running += sc
                     color = player["colors"][rnd_idx] if rnd_idx < len(player["colors"]) else "—"
                     opp_rating = get_player(opp)["rating"] if opp != "BYE" and get_player(opp) else "—"
+                    # Find opponent final rank if available
+                    standings = get_standings()
+                    name_to_rank = {s["Name"]: idx + 1 for idx, s in enumerate(standings)}
+                    opp_rank = name_to_rank.get(opp)
+                    if opp == "BYE":
+                        res_label = "BYE"
+                    elif sc == 1.0:
+                        res_label = f"W{opp_rank if opp_rank else '?'}"
+                    elif sc == 0.5:
+                        res_label = f"D{opp_rank if opp_rank else '?'}"
+                    elif sc == 0.0:
+                        res_label = f"L{opp_rank if opp_rank else '?'}"
+                    else:
+                        res_label = score_str(sc)
+
                     detail_rows.append({
                         "Rnd": rnd_idx + 1,
                         "Color": "⬜ White" if color == "W" else "⬛ Black",
                         "Opponent": opp,
                         "Opp Rtg": opp_rating,
-                        "Result": result_icon(sc),
+                        "Result": res_label,
                         "Points": score_str(sc),
                         "Running": f"{running:.1f}",
                     })
