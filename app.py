@@ -2,7 +2,10 @@ import streamlit as st
 import pandas as pd
 import random
 import math
+import json
 from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
 
 # ── Page Config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -72,6 +75,73 @@ def init_state():
 init_state()
 
 
+# ── Tournament Persistence ────────────────────────────────────────────────────
+
+def get_tournaments_file():
+    """Get the path to the tournaments history file.
+    Uses a local data directory that persists on Streamlit Cloud."""
+    data_dir = Path(__file__).parent / "data"
+    data_dir.mkdir(exist_ok=True)
+    return data_dir / "tournaments.json"
+
+
+def load_tournaments():
+    """Load all saved tournaments from file."""
+    tfile = get_tournaments_file()
+    if tfile.exists():
+        try:
+            with open(tfile, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            st.warning(f"Could not load tournament history: {e}")
+            return []
+    return []
+
+
+def save_tournament(tournament_data):
+    """Save a completed tournament to file."""
+    tfile = get_tournaments_file()
+    tournaments = load_tournaments()
+    tournaments.append(tournament_data)
+    try:
+        with open(tfile, 'w') as f:
+            json.dump(tournaments, f, indent=2, default=str)
+    except Exception as e:
+        st.error(f"Could not save tournament: {e}")
+
+
+def get_tournament_data():
+    """Package current tournament data for saving."""
+    standings = get_standings()
+    rating_changes = st.session_state.get("rating_changes", {})
+    
+    return {
+        "id": datetime.now().isoformat(),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "num_players": len(st.session_state.players),
+        "num_rounds": st.session_state.num_rounds,
+        "upset_factor": st.session_state.get("upset", 0.06),
+        "standings": [
+            {
+                "rank": idx + 1,
+                "name": row["Name"],
+                "rating": row["Rating"],
+                "score": row["Score"],
+                "buchholz": row["Buchholz"],
+            }
+            for idx, row in enumerate(standings)
+        ],
+        "rating_changes": rating_changes,
+        "players_initial": [
+            {
+                "name": p["name"],
+                "rating": st.session_state.original_ratings.get(p["name"], p["rating"])
+            }
+            for p in st.session_state.players
+        ]
+    }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_player(name):
@@ -85,6 +155,7 @@ def fresh_player(name, rating):
     return {
         "name": name,
         "rating": int(rating),
+        "max_rating": int(rating),  # track highest rating achieved for floor calculation
         "score": 0.0,
         "colors": [],          # list of 'W' or 'B' each round
         "opponents": set(),    # names of past opponents
@@ -413,9 +484,20 @@ def compute_and_apply_rating_changes():
         delta = k * (actual - expected)
         delta_rounded = int(round(delta))
         # Apply change to player rating
-        p["rating"] = int(round(orig_r + delta_rounded))
+        new_rating = int(round(orig_r + delta_rounded))
+        
+        # Enforce rating floor: cannot drop below (highest_bracket - 200)
+        # e.g., if max_rating was 1966, bracket is 1900, floor is 1700
+        max_rating = p.get("max_rating", orig_r)
+        highest_bracket = (int(max_rating) // 100) * 100
+        rating_floor = highest_bracket - 200
+        
+        new_rating = max(new_rating, rating_floor)
+        
+        p["rating"] = new_rating
+        p["max_rating"] = max(max_rating, new_rating)  # update max_rating if new rating is higher
         p["rating_change"] = delta_rounded
-        changes[name] = {"old": orig_r, "delta": delta_rounded, "new": p["rating"]}
+        changes[name] = {"old": orig_r, "delta": delta_rounded, "new": p["rating"], "floor": rating_floor}
 
     st.session_state.ratings_applied = True
     return changes
@@ -505,7 +587,7 @@ st.markdown('<div class="main-title">♟️ Chess Swiss Tournament Simulator</di
 st.caption("USCF Swiss pairing system · Elo-based simulation · Buchholz tiebreaks")
 st.markdown("---")
 
-tab1, tab2, tab3 = st.tabs(["👥  Players & Setup", "🏟️  Tournament", "📊  Standings"])
+tab1, tab2, tab3, tab4 = st.tabs(["👥  Players & Setup", "🏟️  Tournament", "📊  Standings", "📜  History"])
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -735,8 +817,16 @@ with tab2:
             # Apply rating changes once when tournament completes
             if not st.session_state.get("ratings_applied", False):
                 rating_changes = compute_and_apply_rating_changes()
+                st.session_state.rating_changes = rating_changes
+                # Save tournament to history
+                try:
+                    tourn_data = get_tournament_data()
+                    save_tournament(tourn_data)
+                    st.success("✅ Tournament saved to history!")
+                except Exception as e:
+                    st.warning(f"Could not save tournament: {e}")
             else:
-                rating_changes = {}
+                rating_changes = st.session_state.get("rating_changes", {})
 
             standings = get_standings()
             if standings:
@@ -894,3 +984,76 @@ with tab3:
                 st.line_chart(chart_data.set_index("Round"), use_container_width=True, height=180)
             else:
                 st.info("No results yet for this player.")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 4 – TOURNAMENT HISTORY
+# ════════════════════════════════════════════════════════════════════════════════
+with tab4:
+    tournaments = load_tournaments()
+    
+    if not tournaments:
+        st.info("No tournament history yet. Complete a tournament to see it here.")
+    else:
+        st.markdown(f'<div class="section-header">Previous Tournaments ({len(tournaments)})</div>',
+                    unsafe_allow_html=True)
+        
+        # Reverse order so newest tournaments appear first
+        for idx, tourn in enumerate(reversed(tournaments)):
+            timestamp = tourn.get("timestamp", "Unknown")
+            num_players = tourn.get("num_players", 0)
+            num_rounds = tourn.get("num_rounds", 0)
+            
+            # Get winner
+            standings = tourn.get("standings", [])
+            winner = standings[0]["name"] if standings else "Unknown"
+            winner_score = standings[0]["score"] if standings else 0
+            
+            with st.expander(f"🏆 {timestamp} · {num_players} players · {num_rounds} rounds · Winner: **{winner}** ({winner_score}pts)"):
+                col1, col2 = st.columns([1, 1])
+                
+                with col1:
+                    st.markdown("**Initial Ratings**")
+                    init_df = pd.DataFrame(tourn.get("players_initial", []))
+                    st.dataframe(init_df, hide_index=True, use_container_width=True, height=200)
+                
+                with col2:
+                    st.markdown("**Rating Changes**")
+                    rating_changes = tourn.get("rating_changes", {})
+                    if rating_changes:
+                        rc_display = []
+                        for name, info in rating_changes.items():
+                            sign = "+" if info["delta"] >= 0 else ""
+                            rc_display.append({
+                                "Player": name,
+                                "Change": f"{sign}{info['delta']}",
+                                "New Rating": info["new"],
+                            })
+                        rc_df = pd.DataFrame(rc_display)
+                        st.dataframe(rc_df, hide_index=True, use_container_width=True, height=200)
+                    else:
+                        st.text("No rating changes recorded")
+                
+                st.markdown("---")
+                st.markdown("**Final Standings**")
+                
+                final_df = pd.DataFrame([
+                    {
+                        "Rank": rank_medal(s["rank"] - 1),
+                        "Player": s["name"],
+                        "Final Rating": s["rating"],
+                        "Score": s["score"],
+                        "Buchholz": s["buchholz"],
+                    }
+                    for s in standings
+                ])
+                
+                st.dataframe(
+                    final_df,
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Score": st.column_config.NumberColumn(format="%.1f"),
+                        "Buchholz": st.column_config.NumberColumn(format="%.1f"),
+                    },
+                )
