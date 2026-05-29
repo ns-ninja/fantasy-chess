@@ -115,6 +115,14 @@ def get_tournament_data():
     standings = get_standings()
     rating_changes = st.session_state.get("rating_changes", {})
     
+    # Build game records for each player
+    games_data = {}
+    for p in st.session_state.players:
+        games_data[p["name"]] = {
+            "results": p["results"],
+            "colors": p["colors"]
+        }
+    
     return {
         "id": datetime.now().isoformat(),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -138,8 +146,40 @@ def get_tournament_data():
                 "rating": st.session_state.original_ratings.get(p["name"], p["rating"])
             }
             for p in st.session_state.players
-        ]
+        ],
+        "games_data": games_data
     }
+
+
+def aggregate_player_stats(player_name):
+    """Aggregate opponent stats for a player across all tournaments.
+    Returns a dict: opponent_name -> {games, wins, draws, losses}"""
+    tournaments = load_tournaments()
+    opponent_stats = defaultdict(lambda: {"games": 0, "wins": 0, "draws": 0, "losses": 0})
+    
+    for tourn in tournaments:
+        games = tourn.get("games_data", {})
+        if player_name not in games:
+            continue
+        
+        player_games = games[player_name]
+        results = player_games.get("results", [])
+        
+        for opponent_name, score in results:
+            if opponent_name == "BYE":
+                continue
+            
+            stats = opponent_stats[opponent_name]
+            stats["games"] += 1
+            
+            if score == 1.0:
+                stats["wins"] += 1
+            elif score == 0.5:
+                stats["draws"] += 1
+            elif score == 0.0:
+                stats["losses"] += 1
+    
+    return opponent_stats
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1057,3 +1097,82 @@ with tab4:
                         "Buchholz": st.column_config.NumberColumn(format="%.1f"),
                     },
                 )
+        
+        st.markdown("---")
+        st.markdown('<div class="section-header">Player Statistics (All Tournaments)</div>',
+                    unsafe_allow_html=True)
+        
+        # Get all unique players across all tournaments
+        all_players = set()
+        for tourn in tournaments:
+            for player in tourn.get("standings", []):
+                all_players.add(player["name"])
+        
+        all_players = sorted(list(all_players))
+        
+        if all_players:
+            selected_player = st.selectbox("Select player to view opponent record",
+                                           options=all_players,
+                                           key="history_player_select")
+            
+            if selected_player:
+                opponent_stats = aggregate_player_stats(selected_player)
+                
+                if opponent_stats:
+                    # Build display table
+                    stats_rows = []
+                    for rank, (opponent, stats) in enumerate(sorted(opponent_stats.items(),
+                                                                     key=lambda x: x[1]["games"],
+                                                                     reverse=True), 1):
+                        games = stats["games"]
+                        wins = stats["wins"]
+                        draws = stats["draws"]
+                        losses = stats["losses"]
+                        win_pct = (wins / games * 100) if games > 0 else 0
+                        
+                        stats_rows.append({
+                            "Rank": rank,
+                            "Opponent": opponent,
+                            "Games": games,
+                            "Win": wins,
+                            "Draw": draws,
+                            "Loss": losses,
+                            "Win %": f"{win_pct:.1f}",
+                        })
+                    
+                    stats_df = pd.DataFrame(stats_rows)
+                    st.dataframe(
+                        stats_df,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Games": st.column_config.NumberColumn(),
+                            "Win": st.column_config.NumberColumn(),
+                            "Draw": st.column_config.NumberColumn(),
+                            "Loss": st.column_config.NumberColumn(),
+                        },
+                    )
+                    
+                    # Summary stats
+                    total_games = sum(s["games"] for s in opponent_stats.values())
+                    total_wins = sum(s["wins"] for s in opponent_stats.values())
+                    total_draws = sum(s["draws"] for s in opponent_stats.values())
+                    total_losses = sum(s["losses"] for s in opponent_stats.values())
+                    overall_win_pct = (total_wins / total_games * 100) if total_games > 0 else 0
+                    
+                    st.markdown("---")
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Total Games", total_games)
+                    with col2:
+                        st.metric("Wins", total_wins)
+                    with col3:
+                        st.metric("Draws", total_draws)
+                    with col4:
+                        st.metric("Losses", total_losses)
+                    
+                    st.metric("Overall Win %", f"{overall_win_pct:.1f}%")
+                else:
+                    st.info(f"{selected_player} has no recorded games in tournament history.")
+        else:
+            st.info("No players found in tournament history.")
